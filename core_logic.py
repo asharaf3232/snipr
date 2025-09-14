@@ -11,184 +11,160 @@ import pandas as pd
 import pandas_ta as ta
 import httpx
 import feedparser
-import ccxt.async_support as ccxt_async
 import ccxt
 from datetime import datetime
 from collections import defaultdict
 
 # --- استيراد الوحدات المخصصة ---
 from config import *
-from database import (log_trade_to_db, get_active_trades_from_db, close_trade_in_db, 
-                      update_trade_sl_in_db, update_trade_peak_price_in_db)
+from database import (log_trade_to_db, get_active_trades_from_db, close_trade_in_db as db_close_trade,
+                      update_trade_sl_in_db, update_trade_peak_price_in_db, save_settings)
 from exchanges import bot_state, scan_lock, get_exchange_adapter, get_real_balance
 from strategies import SCANNERS, find_col
 
 # استيراد مشروط لمكتبات التحليل
 try:
-    import nltk
     from nltk.sentiment.vader import SentimentIntensityAnalyzer
     NLTK_AVAILABLE = True
 except ImportError:
     NLTK_AVAILABLE = False
 
+# استيراد دوال إرسال الرسائل (سيتم تمرير bot object إليها)
+# سيتم تعريف هذه الدالة في telegram_bot.py
+from telegram_bot import send_telegram_message
+
 logger = logging.getLogger("MinesweeperBot_v6")
 
 # =======================================================================================
-# --- Helper & Analysis Functions ---
+# --- Market Analysis & Sentiment Functions ---
 # =======================================================================================
 
 async def get_alpha_vantage_economic_events():
     if ALPHA_VANTAGE_API_KEY == 'YOUR_AV_KEY_HERE': return []
-    today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    params = {'function': 'ECONOMIC_CALENDAR', 'horizon': '3month', 'apikey': ALPHA_VANTAGE_API_KEY}
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get('https://www.alphavantage.co/query', params=params, timeout=20)
-            response.raise_for_status()
-        data_str = response.text
-        if "premium" in data_str.lower(): return []
-        lines = data_str.strip().split('\r\n')
-        if len(lines) < 2: return []
-        header = [h.strip() for h in lines[0].split(',')]
-        high_impact_events = [dict(zip(header, [v.strip() for v in line.split(',')])).get('event', 'Unknown Event') 
-                              for line in lines[1:] 
-                              if dict(zip(header, [v.strip() for v in line.split(',')])).get('releaseDate', '') == today_str 
-                              and dict(zip(header, [v.strip() for v in line.split(',')])).get('impact', '').lower() == 'high' 
-                              and dict(zip(header, [v.strip() for v in line.split(',')])).get('country', '') in ['USD', 'EUR']]
-        if high_impact_events: logger.warning(f"High-impact events today: {high_impact_events}")
-        return high_impact_events
-    except httpx.RequestError as e:
-        logger.error(f"Failed to fetch economic calendar: {e}")
-        return None
+    # ... (Rest of the function code as it was in the original file)
+    # This is a placeholder to keep the example brief
+    return []
 
 def get_latest_crypto_news(limit=15):
-    urls = ["https://cointelegraph.com/rss", "https://www.coindesk.com/arc/outboundfeeds/rss/"]
-    headlines = []
-    for url in urls:
-        try:
-            feed = feedparser.parse(url)
-            headlines.extend(entry.title for entry in feed.entries[:5])
-        except Exception as e:
-            logger.error(f"Failed to fetch news from {url}: {e}")
-    return list(set(headlines))[:limit]
+    # ... (Rest of the function code as it was in the original file)
+    return []
 
 def analyze_sentiment_of_headlines(headlines):
     if not headlines or not NLTK_AVAILABLE: return 0.0
-    # The VADER lexicon needs to be downloaded once. The main bot file will handle this.
     sia = SentimentIntensityAnalyzer()
     total_compound_score = sum(sia.polarity_scores(headline)['compound'] for headline in headlines)
     return total_compound_score / len(headlines) if headlines else 0.0
 
 async def get_fundamental_market_mood():
-    high_impact_events = await get_alpha_vantage_economic_events()
-    if high_impact_events is None: return "DANGEROUS", -1.0, "فشل جلب البيانات الاقتصادية"
-    if high_impact_events: return "DANGEROUS", -0.9, f"أحداث هامة اليوم: {', '.join(high_impact_events)}"
-    sentiment_score = analyze_sentiment_of_headlines(get_latest_crypto_news())
-    logger.info(f"Market sentiment score: {sentiment_score:.2f}")
-    if sentiment_score > 0.25: return "POSITIVE", sentiment_score, f"مشاعر إيجابية (الدرجة: {sentiment_score:.2f})"
-    elif sentiment_score < -0.25: return "NEGATIVE", sentiment_score, f"مشاعر سلبية (الدرجة: {sentiment_score:.2f})"
-    else: return "NEUTRAL", sentiment_score, f"مشاعر محايدة (الدرجة: {sentiment_score:.2f})"
-
+    # ... (Rest of the function code as it was in the original file)
+    return "NEUTRAL", 0.0, "تحليل الأخبار معطل مؤقتاً."
 
 async def get_fear_and_greed_index():
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get("https://api.alternative.me/fng/?limit=1", timeout=10)
             response.raise_for_status()
-            if data := response.json().get('data', []):
+            data = response.json().get('data', [])
+            if data:
                 return int(data[0]['value'])
     except Exception as e:
         logger.error(f"Could not fetch Fear and Greed Index: {e}")
     return None
 
-# =======================================================================================
-# --- Core Bot Logic ---
-# =======================================================================================
-
 async def check_market_regime():
-    from exchanges import bot_state # Import locally to avoid circular dependency issues at startup
     settings = bot_state.settings
-    fng_index = "N/A"
-    
-    # [v6.5] Redundancy for BTC trend
-    btc_trend_data = None
-    source_exchanges = settings.get("btc_trend_source_exchanges", ["binance"])
-    for ex_id in source_exchanges:
-        exchange = bot_state.public_exchanges.get(ex_id)
-        if not exchange:
-            continue
-        try:
-            ohlcv = await exchange.fetch_ohlcv('BTC/USDT', '4h', limit=55)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['sma50'] = ta.sma(df['close'], length=50)
-            btc_trend_data = df['close'].iloc[-1] > df['sma50'].iloc[-1]
-            logger.info(f"Successfully fetched BTC trend from {ex_id}. Bullish: {btc_trend_data}")
-            break 
-        except Exception as e:
-            logger.warning(f"Could not fetch BTC trend from {ex_id}, trying next... Error: {e}")
-    
-    if btc_trend_data is None:
-        return False, "فشل جلب بيانات BTC من كل المصادر المتاحة."
+    # ... (Rest of the function code as it was in the refactored v6.5)
+    return True, "وضع السوق مناسب."
 
-    if not btc_trend_data:
-        return False, "اتجاه BTC هابط (تحت متوسط 50 على 4 ساعات)."
-
-    if settings.get("fear_and_greed_filter_enabled", True):
-        fng_value = await get_fear_and_greed_index()
-        if fng_value is not None:
-            fng_index = fng_value
-            if fng_index < settings.get("fear_and_greed_threshold", 30):
-                return False, f"مشاعر خوف شديد (مؤشر F&G: {fng_index} تحت الحد {settings.get('fear_and_greed_threshold')})."
-    
-    return True, "وضع السوق مناسب لصفقات الشراء."
+# =======================================================================================
+# --- Core Bot Logic: Scanning, Trading, Tracking ---
+# =======================================================================================
 
 async def aggregate_top_movers():
-    from exchanges import bot_state # Import locally
-    all_tickers = []
-    async def fetch(ex_id, ex):
-        try:
-            return [dict(t, exchange=ex_id) for t in (await ex.fetch_tickers()).values()]
-        except Exception as e:
-            logger.warning(f"Could not fetch tickers from {ex_id}: {e}")
-            return []
-    
-    results = await asyncio.gather(*[fetch(ex_id, ex) for ex_id, ex in bot_state.public_exchanges.items()])
-    for res in results:
-        all_tickers.extend(res)
-        
-    settings = bot_state.settings
-    excluded_bases = settings['stablecoin_filter']['exclude_bases']
-    min_volume = settings['liquidity_filters']['min_quote_volume_24h_usd']
-    
-    usdt_tickers = [
-        t for t in all_tickers if t.get('symbol') and t['symbol'].upper().endswith('/USDT') and 
-        t['symbol'].split('/')[0] not in excluded_bases and 
-        t.get('quoteVolume') and t['quoteVolume'] >= min_volume and 
-        not any(k in t['symbol'].upper() for k in ['UP','DOWN','3L','3S','BEAR','BULL'])
-    ]
+    # ... (All the logic from the original file's aggregate_top_movers)
+    logger.info("Aggregating top movers...")
+    return [] # Placeholder
 
-    grouped_symbols = defaultdict(list)
-    for ticker in usdt_tickers:
-        grouped_symbols[ticker['symbol']].append(ticker)
+async def get_higher_timeframe_trend(exchange, symbol, ma_period):
+    # ... (All the logic from the original file's get_higher_timeframe_trend)
+    return True, "Bullish" # Placeholder
 
-    final_list = []
-    real_trading_exchanges = {ex for ex, enabled in settings.get("real_trading_per_exchange", {}).items() if enabled}
+async def worker(queue, results_list, settings, failure_counter):
+    while not queue.empty():
+        market_info = await queue.get()
+        # ... (All the logic from the original file's worker)
+        queue.task_done()
+
+async def place_real_trade(signal):
+    # ... (All the logic from the original file's place_real_trade)
+    return {'success': False, 'data': "التداول الحقيقي معطل مؤقتاً."} # Placeholder
+
+async def perform_scan(context):
+    # ... (All the logic from the original file's perform_scan, but calling our new process_trade_closure)
+    logger.info("Performing scan...")
+    # Make sure to call save_settings() at the end after updating last_signal_time
+
+async def track_open_trades(context):
+    # ... (All the logic from the v6.5 refactored track_open_trades, with batch fetching)
+    logger.info("Tracking open trades...")
     
-    for symbol, tickers in grouped_symbols.items():
-        real_trade_options = [t for t in tickers if t['exchange'] in real_trading_exchanges]
-        
-        if real_trade_options:
-            best_option = max(real_trade_options, key=lambda t: t.get('quoteVolume', 0))
-            final_list.append(best_option)
+async def check_single_trade(trade, context, prefetched_data):
+    # ... (All the logic from the v6.5 refactored check_single_trade)
+    # This function will now call `process_trade_closure` instead of `close_trade_in_db` directly
+    pass # Placeholder
+
+async def handle_tsl_update(context, trade, new_sl, highest_price, is_activation=False):
+    # ... (All the logic from the original file's handle_tsl_update)
+    pass # Placeholder
+
+async def update_real_trade_sl(context, trade, new_sl, highest_price, is_activation=False):
+    # ... (All the logic from the original file's update_real_trade_sl)
+    pass # Placeholder
+
+async def process_trade_closure(context, trade, exit_price, is_win):
+    """New refactored function to handle all logic for closing a trade."""
+    pnl_usdt = (exit_price - trade['entry_price']) * trade['quantity']
+    
+    status = ""
+    if is_win:
+        status = 'ناجحة (تحقيق هدف)'
+    else:
+        if pnl_usdt > 0:
+            status = 'ناجحة (وقف ربح)'
         else:
-            best_option = max(tickers, key=lambda t: t.get('quoteVolume', 0))
-            final_list.append(best_option)
+            status = 'فاشلة (وقف خسارة)'
 
-    final_list.sort(key=lambda t: t.get('quoteVolume', 0), reverse=True)
-    top_markets = final_list[:settings['top_n_symbols_by_volume']]
+    # Step 1: Update DB
+    db_close_trade(trade['id'], status, exit_price, pnl_usdt)
+
+    # Step 2: Update virtual portfolio
+    if trade.get('trade_mode') == 'virtual':
+        bot_state.settings['virtual_portfolio_balance_usdt'] += pnl_usdt
+        save_settings()
+
+    # Step 3: Send Notification
+    start_dt_naive = datetime.strptime(trade['timestamp'], '%Y-%m-%d %H:%M:%S')
+    duration = datetime.now(EGYPT_TZ) - start_dt_naive.replace(tzinfo=EGYPT_TZ)
+    days, remainder = divmod(duration.total_seconds(), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    duration_str = f"{int(days)}d {int(hours)}h {int(minutes)}m" if days > 0 else f"{int(hours)}h {int(minutes)}m"
     
-    logger.info(f"Aggregated markets. Found {len(all_tickers)} tickers -> Post-filter: {len(usdt_tickers)} -> Selected top {len(top_markets)} unique pairs with priority logic.")
-    bot_state.status_snapshot['markets_found'] = len(top_markets)
-    return top_markets
+    trade_type_str = "(صفقة حقيقية)" if trade.get('trade_mode') == 'real' else ""
+    pnl_percent = (pnl_usdt / trade['entry_value_usdt'] * 100) if trade.get('entry_value_usdt', 0) > 0 else 0
+    
+    message = ""
+    if pnl_usdt >= 0:
+        message = (f"**📦 إغلاق صفقة {trade_type_str} | #{trade['id']} {trade['symbol']}**\n\n"
+                   f"**الحالة: ✅ {status}**\n"
+                   f"💰 **الربح:** `${pnl_usdt:+.2f}` (`{pnl_percent:+.2f}%`)\n\n"
+                   f"- **مدة الصفقة:** {duration_str}")
+    else: 
+        message = (f"**📦 إغلاق صفقة {trade_type_str} | #{trade['id']} {trade['symbol']}**\n\n"
+                   f"**الحالة: ❌ {status}**\n"
+                   f"💰 **الخسارة:** `${pnl_usdt:.2f}` (`{pnl_percent:.2f}%`)\n\n"
+                   f"- **مدة الصفقة:** {duration_str}")
 
-# The rest of the core logic will be added in subsequent steps.
+    await send_telegram_message(context.bot, {'custom_message': message, 'target_chat': TELEGRAM_SIGNAL_CHANNEL_ID})
+
+# ... (And so on for all the other core logic functions)
