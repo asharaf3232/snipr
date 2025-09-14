@@ -232,7 +232,7 @@ async def place_real_trade(signal):
     return {'success': False, 'data': "Placeholder"}
 
 async def perform_scan(context):
-    from telegram_bot import send_telegram_message # Local import to avoid circular dependency
+    from binance_trader import send_telegram_message # Local import to avoid circular dependency
     # ... [The entire logic of the perform_scan function] ...
     # This includes calling the worker, processing signals, and calling place_real_trade.
     # It must call save_settings() at the end to persist the last_signal_time.
